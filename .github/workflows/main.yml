@@ -1,28 +1,25 @@
-name: Deploy Chatbot
+name: 🚀 Run Netflix Chatbot
 
 on:
   push:
-    branches:
-      - main  # change to 'master' if your branch is master
+    branches: [ main ]
 
 jobs:
-  deploy:
+  run-bot:
     runs-on: ubuntu-latest
-
     steps:
-    - name: ✅ Checkout code
-      uses: actions/checkout@v3
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v3
 
-    - name: 🐍 Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'  # use the Python version your bot requires
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: 📦 Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        if [ -s requirements.txt ]; then pip install -r requirements.txt; else echo "No dependencies to install."; fi
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: 🚀 Run chatbot (for testing only)
-      run: |
-        python app.py
+      - name: ▶️ Run app.py
+        run: python app.py
