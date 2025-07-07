@@ -22,5 +22,6 @@ jobs:
         python -m pip install --upgrade pip
         pip install gradio ollama
 
-    - name: 🚀 Run chatbot (Gradio App)
-      run: python chatbot/app.py
+   - name: 🚀 Run chatbot (Gradio App)
+  run: python ./chatbot/app.py
+
