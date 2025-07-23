@@ -1,31 +1,21 @@
-import pandas as pd
 import gradio as gr
-import spacy
+import pandas as pd
 import re
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+import spacy
+from sentence_transformers import SentenceTransformer, util
 import subprocess
 import json
 
-# Load data
+# Load models and data
 df = pd.read_csv("netflix_titles.csv")
-df.fillna("", inplace=True)
+df["release_year"] = pd.to_numeric(df["release_year"], errors='coerce')
+df.dropna(subset=["title", "description", "release_year"], inplace=True)
+df.reset_index(drop=True, inplace=True)
 
-# Clean columns
-df.columns = [col.lower().strip() for col in df.columns]
-
-# Load spaCy NLP model
+model = SentenceTransformer("all-MiniLM-L6-v2")
 nlp = spacy.load("en_core_web_sm")
 
-# Load Sentence Transformer
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# Embed all titles + descriptions
-texts = df["title"] + " " + df["description"]
-embeddings = model.encode(texts.tolist(), show_progress_bar=True)
-
-# Define helper for filter extraction
+# Function to extract filters
 def extract_filters(user_query):
     doc = nlp(user_query.lower())
     filters = {
@@ -33,18 +23,33 @@ def extract_filters(user_query):
         "country": None,
         "listed_in": None,
         "release_year": None,
+        "before_year": None,
+        "after_year": None,
+        "between_years": None,
     }
 
-    # Find year
-    year_match = re.search(r"\b(19|20)\d{2}\b", user_query)
-    if year_match:
-        filters["release_year"] = year_match.group()
+    before_match = re.search(r"before\s+(19|20)\d{2}", user_query)
+    if before_match:
+        filters["before_year"] = int(before_match.group().split()[-1])
+
+    after_match = re.search(r"after\s+(19|20)\d{2}", user_query)
+    if after_match:
+        filters["after_year"] = int(after_match.group().split()[-1])
+
+    between_match = re.search(r"between\s+(19|20)\d{2}\s+and\s+(19|20)\d{2}", user_query)
+    if between_match:
+        years = re.findall(r"(19|20)\d{2}", between_match.group())
+        if len(years) == 2:
+            filters["between_years"] = (int(years[0]), int(years[1]))
+
+    exact_year = re.search(r"(in|from|of|released in)?\s*(19|20)\d{2}", user_query)
+    if exact_year and not (filters["before_year"] or filters["after_year"] or filters["between_years"]):
+        filters["release_year"] = int(re.search(r"(19|20)\d{2}", exact_year.group()).group())
 
     for ent in doc.ents:
         if ent.label_ == "GPE":
             filters["country"] = ent.text.title()
 
-    # Genre & Type manual match
     genre_keywords = {
         "action", "comedy", "drama", "horror", "romance", "thriller",
         "documentary", "sci-fi", "crime", "kids", "family", "anime"
@@ -60,63 +65,80 @@ def extract_filters(user_query):
 
     return filters
 
-# Filter function
+# Function to apply filters to dataframe
 def filter_data(filters):
     temp = df.copy()
+
     if filters["type"]:
         temp = temp[temp["type"].str.lower() == filters["type"].lower()]
     if filters["country"]:
         temp = temp[temp["country"].str.contains(filters["country"], case=False, na=False)]
     if filters["listed_in"]:
         temp = temp[temp["listed_in"].str.contains(filters["listed_in"], case=False, na=False)]
-    if filters["release_year"]:
-        temp = temp[temp["release_year"].astype(str) == filters["release_year"]]
+
+    if filters["between_years"]:
+        start, end = filters["between_years"]
+        temp = temp[(temp["release_year"] >= start) & (temp["release_year"] <= end)]
+    elif filters["after_year"] and filters["before_year"]:
+        temp = temp[(temp["release_year"] > filters["after_year"]) & (temp["release_year"] < filters["before_year"])]
+    elif filters["after_year"]:
+        temp = temp[temp["release_year"] > filters["after_year"]]
+    elif filters["before_year"]:
+        temp = temp[temp["release_year"] < filters["before_year"]]
+    elif filters["release_year"]:
+        temp = temp[temp["release_year"] == filters["release_year"]]
+
     return temp
 
-# Mistral prompt builder
-def build_prompt(query, results):
-    if results.empty:
-        return f"User asked: '{query}'\nThere were no matching results in the Netflix database."
+# Function to build prompt
+def build_prompt(user_query, results):
+    prompt = f"User asked: '{user_query}'\n\nHere are some matching Netflix titles:\n"
+    top_5 = results.head(5).to_dict(orient="records")
 
-    top_3 = results.head(3).to_dict(orient="records")
-    prompt = f"You are a helpful Netflix assistant. User asked: \"{query}\".\n"
-    prompt += "Based on the database, here are some matching titles:\n\n"
-    for item in top_3:
+    for item in top_5:
         prompt += f"- **{item['title']}** ({item['release_year']}): {item['description']}\n"
-    prompt += "\nGive a short natural reply to the user."
+    
     return prompt
 
-# Call Mistral using Ollama
-def query_mistral(prompt):
+# Function to call Mistral using Ollama (modify if you're using Hugging Face API)
+def call_mistral(prompt):
     try:
         result = subprocess.run(
             ["ollama", "run", "mistral", "--", prompt],
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=60
         )
-        return result.stdout.strip()
-    except Exception as e:
-        return f"Error calling Mistral: {e}"
+        return result.stdout.strip() if result.returncode == 0 else "LLM error: No output."
+    except subprocess.TimeoutExpired:
+        return "Request timed out. Please try again."
 
-# Main chatbot function
-def chat(query):
-    filters = extract_filters(query)
-    filtered = filter_data(filters)
+# Main chatbot logic
+def chatbot_response(message, chat_history):
+    filters = extract_filters(message)
+    results = filter_data(filters)
 
-    # Semantic similarity fallback if no filter result
-    if filtered.empty:
-        query_embed = model.encode([query])
-        sims = cosine_similarity(query_embed, embeddings)[0]
-        top_idx = np.argsort(sims)[-5:][::-1]
-        filtered = df.iloc[top_idx]
+    if results.empty:
+        return "Sorry, no matching titles found."
 
-    prompt = build_prompt(query, filtered)
-    response = query_mistral(prompt)
-    return response
+    prompt = build_prompt(message, results)
+    reply = call_mistral(prompt)
 
-# Gradio UI
-iface = gr.Interface(fn=chat, inputs="text", outputs="text", title="🎬 Netflix Chatbot with Mistral")
+    return reply
+
+# Gradio Chat Interface
+chat_ui = gr.ChatInterface(
+    chatbot_response,
+    title="Netflix ChatBot 🎬",
+    theme="soft",
+    examples=[
+        "Suggest comedy shows after 2010 from India",
+        "Romantic movies from 2017 in United Kingdom",
+        "Show horror series between 2015 and 2020",
+        "Movies before 2012 in Japan",
+    ]
+)
 
 if __name__ == "__main__":
-    iface.launch(share=True)
+    chat_ui.launch(server_name="0.0.0.0", server_port=7860)
+
